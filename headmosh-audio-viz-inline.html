@@ -1,0 +1,317 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Headmosh — Viz + Audio (your audio.js & viz.js)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <style>
+    html,body{margin:0;height:100%;background:#000;font-family:ui-sans-serif,system-ui,Inter,Roboto,Arial;cursor:default}
+    .topbar{
+      position:fixed;left:18px;top:18px;z-index:9;display:flex;gap:10px;align-items:center;flex-wrap:wrap
+    }
+    .panel{
+      background:rgba(0,0,0,.55);backdrop-filter:blur(6px);
+      border:1px solid rgba(255,255,255,.15);border-radius:12px;color:#e8f3ff;
+      padding:8px 12px;font-size:13px;line-height:1.4;display:flex;gap:10px;align-items:center
+    }
+    .panel select,.panel button{
+      background:rgba(0,0,0,.35);color:#e8f3ff;border:1px solid rgba(255,255,255,.15);
+      border-radius:10px;padding:6px 10px;font-size:13px
+    }
+    .pump-link{
+      background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.15);border-radius:12px;color:#e8f3ff;text-decoration:none;
+      padding:10px 14px;font-size:14px;line-height:1;display:flex;gap:10px;align-items:center
+    }
+    .pump-dot{width:8px;height:8px;border-radius:50%;background:rgb(60,200,255);box-shadow:0 0 12px 4px rgba(60,200,255,.7)}
+    #meter{position:fixed;left:18px;bottom:18px;width:260px;height:10px;background:#111;border:1px solid #333;border-radius:999px;overflow:hidden;z-index:9}
+    #meter > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#27ffbe,#4ca5ff)}
+    .lower-third{
+      position:fixed;left:18px;bottom:42px;z-index:9;
+      background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.2);
+      color:#e8f3ff;padding:8px 12px;border-radius:10px;font-size:12px
+    }
+    #pillbar{display:flex;gap:8px;margin-top:6px}
+    .pill{border:1px solid rgba(255,255,255,.15);border-radius:999px;padding:2px 8px;font-size:11px;color:#bfe}
+    #hud{position:fixed;right:18px;bottom:18px;color:#cde;font-size:12px;background:rgba(0,0,0,.5);padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12)}
+    #drop{position:fixed;right:18px;top:18px;color:#0ff;background:rgba(0,0,0,.5);padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:none}
+    #drop.show{display:block;animation:pop 1.2s ease}
+    @keyframes pop{0%{transform:scale(.9);opacity:.6}30%{transform:scale(1.06);opacity:1}100%{transform:scale(1);opacity:.7}}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <a id="coinUrl" class="pump-link" target="_blank" rel="noreferrer">
+      <span class="pump-dot"></span>
+      <span id="coinText">pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump</span>
+    </a>
+    <div class="panel">
+      <span>Mic:</span>
+      <select id="mic"><option>Loading…</option></select>
+      <button id="start">Start</button>
+      <button id="stop">Stop</button>
+      <span id="status" style="opacity:.8">idle</span>
+    </div>
+    <div class="panel">
+      <span>Palette:</span>
+      <button onclick="HM_onPalette('default')">Default</button>
+      <button onclick="HM_onPalette('neon')">Neon</button>
+      <button onclick="HM_onPalette('ember')">Ember</button>
+      <button onclick="HM_onPalette('mono')">Mono</button>
+    </div>
+  </div>
+
+  <div class="lower-third">
+    <div><b>HEADMOSH STUDIO</b> — Go Head-First.</div>
+    <div id="pillbar">
+      <div class="pill" id="pill-bass">bass 0.00</div>
+      <div class="pill" id="pill-mids">mids 0.00</div>
+      <div class="pill" id="pill-highs">highs 0.00</div>
+    </div>
+  </div>
+
+  <div id="meter"><i id="bar"></i></div>
+  <div id="hud">Hotkeys: [1-4] Palettes • [Space] Burst • [D] Drop</div>
+  <div id="drop">DROP!</div>
+
+  <!-- AUDIO ENGINE (user-supplied audio.js) -->
+  <script>
+  // Multiband audio (standalone) for demo
+  (() => {
+    let ctx, analyser, timeData, freqData, stream;
+    let ema = 0; let bands = {bass:0,mids:0,highs:0};
+    const $ = s => document.querySelector(s);
+    const bar = () => document.getElementById('bar');
+
+    async function enumerate() {
+      try { await navigator.mediaDevices.getUserMedia({audio:true}); } catch(_) {}
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const mics = devs.filter(d => d.kind === 'audioinput');
+      const sel = $('#mic'); sel.innerHTML='';
+      mics.forEach((d,i)=>{ const o=document.createElement('option'); o.value=d.deviceId; o.textContent=d.label||\`Mic \${i+1}\`; sel.appendChild(o); });
+    }
+
+    async function start() {
+      try{
+        $('#status').textContent='starting...';
+        if(!ctx) ctx = new (window.AudioContext||window.webkitAudioContext)();
+        if(ctx.state!=='running') await ctx.resume();
+        stop();
+        const deviceId = $('#mic').value;
+        const constraints = { audio: { deviceId: deviceId?{exact:deviceId}:undefined, echoCancellation:false, noiseSuppression:false, autoGainControl:false } };
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        const src = ctx.createMediaStreamSource(stream);
+        analyser = ctx.createAnalyser(); analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.7;
+        timeData = new Uint8Array(analyser.fftSize);
+        freqData = new Uint8Array(analyser.frequencyBinCount);
+        src.connect(analyser);
+        tick();
+        $('#status').textContent='mic running';
+      }catch(e){ $('#status').textContent='mic error'; alert('Mic error: '+e.message); }
+    }
+    function stop(){ if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null;} analyser=null; }
+    function computeRMS(){
+      if(!analyser) return 0; analyser.getByteTimeDomainData(timeData);
+      let sum=0; for(let i=0;i<timeData.length;i++){ const v=(timeData[i]-128)/128; sum+=v*v; }
+      return Math.sqrt(sum/timeData.length);
+    }
+    function computeBands(){
+      if(!analyser) return {bass:0,mids:0,highs:0};
+      analyser.getByteFrequencyData(freqData);
+      const sr = ctx.sampleRate || 48000; const nyq = sr/2; const binHz = nyq/freqData.length;
+      const BASS_MAX=160, MIDS_MAX=2000, HIGHS_MAX=8000;
+      let sb=0,nb=0, sm=0,nm=0, sh=0,nh=0;
+      for(let i=0;i<freqData.length;i++){
+        const hz=i*binHz; const v=freqData[i]/255;
+        if(hz<=BASS_MAX){ sb+=v; nb++; }
+        else if(hz<=MIDS_MAX){ sm+=v; nm++; }
+        else if(hz<=HIGHS_MAX){ sh+=v; nh++; }
+      }
+      const bass = nb? Math.pow(sb/nb,0.85):0;
+      const mids = nm? Math.pow(sm/nm,0.90):0;
+      const highs= nh? Math.pow(sh/nh,0.95):0;
+      const aB=0.18,aM=0.20,aH=0.22;
+      bands.bass=bands.bass*(1-aB)+bass*aB;
+      bands.mids=bands.mids*(1-aM)+mids*aM;
+      bands.highs=bands.highs*(1-aH)+highs*aH;
+      return bands;
+    }
+    function tick(){
+      const rms=computeRMS(); const a=0.25; ema=ema*(1-a)+rms*a;
+      const bl=computeBands();
+      if(bar()) bar().style.width = Math.min(100, Math.round(ema*300))+'%';
+      const pb=document.getElementById('pill-bass'); const pm=document.getElementById('pill-mids'); const ph=document.getElementById('pill-highs');
+      if(pb) pb.textContent='bass '+bl.bass.toFixed(2); if(pm) pm.textContent='mids '+bl.mids.toFixed(2); if(ph) ph.textContent='highs '+bl.highs.toFixed(2);
+      requestAnimationFrame(tick);
+    }
+    window.getAudioLevel=()=>ema; window.getBandLevels=()=>bands;
+    window.addEventListener('load',()=>{
+      enumerate();
+      document.getElementById('start').onclick=start;
+      document.getElementById('stop').onclick=()=>{ stop(); document.getElementById('status').textContent='stopped'; };
+      navigator.mediaDevices?.addEventListener?.('devicechange', enumerate);
+    });
+  })();
+  </script>
+
+  <!-- VISUALS (user-supplied viz.js) -->
+  <script>
+  // p5 visual + handlers for palette/burst/drop
+  var inc = 0.1, scl = 90, cols, rows, zoff = 0;
+  var particles = [], flowfield;
+  var palette = 'default'; // 'neon', 'mono', etc.
+  var burstTicks = 0;
+
+  // Simple palettes
+  const PALETTES = {
+    default: { bg:'#000000', accent:'#ffc600', ink:'#111111' },
+    neon:    { bg:'#02010f', accent:'#00fff0', ink:'#0a0a2a' },
+    ember:   { bg:'#0b0502', accent:'#ff7a00', ink:'#201008' },
+    mono:    { bg:'#0a0a0a', accent:'#dddddd', ink:'#191919' }
+  };
+  function pal(){ return PALETTES[palette] || PALETTES.default; }
+
+  function setup(){
+    createCanvas(window.innerWidth, window.innerHeight);
+    cols=floor(width/scl); rows=floor(height/scl);
+    flowfield = new Array(cols*rows);
+    for (var i=0;i<30;i++) particles[i]=new Particle();
+    background(pal().bg);
+  }
+
+  function windowResized(){
+    resizeCanvas(window.innerWidth, window.innerHeight);
+    cols=floor(width/scl); rows=floor(height/scl);
+    flowfield = new Array(cols*rows);
+    background(pal().bg);
+  }
+
+  function draw(){
+    const lvl = (typeof getAudioLevel==='function') ? getAudioLevel() : 0.0;
+    const bands = (typeof getBandLevels==='function') ? getBandLevels() : {bass:0,mids:0,highs:0};
+    const bass=constrain(map(bands.bass,0,0.4,0,1),0,1);
+    const mids=constrain(map(bands.mids,0,0.35,0,1),0,1);
+    const highs=constrain(map(bands.highs,0,0.3,0,1),0,1);
+
+    // Burst multiplies mids/highs temporarily
+    const burst = max(0, burstTicks/60.0);
+    const mag = 0.70 + (bass * 0.7) + burst*3;
+    const incBoost = 0.06 + (mids * 0.30) + burst*0.05;
+    const zBoost = 0.00015 + (mids * 0.001) + burst*0.0006;
+    const highlight = highs + burst*0.4;
+
+    var yoff=0;
+    for (var y=0;y<rows;y++){
+      var xoff=0;
+      for (var x=0;x<cols;x++){
+        var index=x+y*cols;
+        var angle=noise(xoff,yoff,zoff)*TWO_PI*7;
+        var v=p5.Vector.fromAngle(angle);
+        v.setMag(mag);
+        flowfield[index]=v;
+        xoff+=incBoost;
+      }
+      yoff+=incBoost;
+      zoff+=zBoost;
+    }
+
+    // transparent overlay to slowly fade trails
+    noStroke(); fill(0, 10); rect(0,0,width,height);
+
+    for (var i=0;i<particles.length;i++){
+      var p=particles[i];
+      p.reactEnergy = constrain(map(lvl,0,0.35,0,1),0,1);
+      p.reactBands = {bass:bass, mids:mids, highs:highlight};
+      p.follow(flowfield); p.update(); p.edges(); p.show();
+    }
+
+    if (burstTicks>0) burstTicks--;
+  }
+
+  // ---- Particle (stylized lines/points) ----
+  function Particle(){
+    this.pos=createVector(random(width),random(height));
+    this.vel=createVector(0,0);
+    this.acc=createVector(0,0);
+    this.maxspeed=0.5;
+    this.prevPos=this.pos.copy();
+    this.reactEnergy=0; this.reactBands={bass:0,mids:0,highs:0};
+
+    this.update=function(){
+      var speedBoost = 1.0 + this.reactBands.bass*0.9 + this.reactBands.mids*0.3;
+      this.vel.add(this.acc); this.vel.limit(this.maxspeed*speedBoost);
+      this.pos.add(this.vel); this.acc.mult(0);
+    }
+    this.applyForce=function(force){ this.acc.add(force); }
+    this.follow=function(vectors){
+      var x=floor(this.pos.x/scl), y=floor(this.pos.y/scl);
+      x=constrain(x,0,cols-1); y=constrain(y,0,rows-1);
+      var index=x+y*cols; var force=vectors[index]; if(force) this.applyForce(force);
+    }
+    this.show=function(){
+      const theme=pal();
+      // layered strokes
+      stroke(theme.ink); strokeWeight(110 + this.reactEnergy*60); strokeCap(SQUARE);
+      line(this.pos.x+3,this.pos.y+30,this.prevPos.x+5,this.prevPos.y+5);
+
+      stroke(theme.accent); strokeWeight(2 + this.reactBands.highs*8); point(this.pos.x+7,this.pos.y-3);
+      if (random()<0.12*this.reactBands.highs){ stroke(255); strokeWeight(1 + this.reactBands.highs*3); point(this.pos.x+random(-8,8), this.pos.y+random(-8,8)); }
+
+      stroke(34); strokeWeight(150); line(this.pos.x+3,this.pos.y+30,this.prevPos.x+5,this.prevPos.y+55);
+      stroke(0); strokeWeight(170); line(this.pos.x+3,this.pos.y+40,this.prevPos.x+5,this.prevPos.y+75);
+      stroke(51); strokeWeight(110); line(this.pos.x+3,this.pos.y+30,this.prevPos.x+5,this.prevPos.y+85);
+
+      // faint white trail
+      stroke(255, 130); strokeWeight(1 + this.reactEnergy*2);
+      line(this.pos.x-80,this.pos.y,this.prevPos.x+60,this.prevPos.y);
+      this.updatePrev();
+    }
+    this.updatePrev=function(){ this.prevPos.x=this.pos.x; this.prevPos.y=this.pos.y; }
+    this.edges=function(){
+      if (this.pos.x>width){ this.pos.x=0; this.updatePrev(); }
+      if (this.pos.x<0){ this.pos.x=width; this.updatePrev(); }
+      if (this.pos.y>height){ this.pos.y=0; this.updatePrev(); }
+      if (this.pos.y<0){ this.pos.y=height; this.updatePrev(); }
+    }
+  }
+
+  // ---- Handlers for mock chat ----
+  window.HM_onPalette = (name)=>{
+    palette = name || 'default';
+    background(pal().bg);
+  };
+  window.HM_onBurst = ({power=1,band='highs'}={})=>{
+    burstTicks = floor(30 + power*60); // ~1–1.5s kick
+    const lt = document.querySelector('.lower-third');
+    if(lt){ lt.style.borderColor = '#ffc600'; setTimeout(()=> lt.style.borderColor = 'rgba(255,255,255,.2)', 400); }
+  };
+  window.HM_onDrop = ()=>{
+    const el=document.getElementById('drop');
+    if(!el) return;
+    el.classList.remove('show'); void el.offsetWidth; el.classList.add('show');
+    setTimeout(()=> el.style.display='none', 1400);
+  };
+
+  // --- Hotkeys ---
+  window.addEventListener('keydown', (e)=>{
+    if(e.key==='1') HM_onPalette('default');
+    if(e.key==='2') HM_onPalette('neon');
+    if(e.key==='3') HM_onPalette('ember');
+    if(e.key==='4') HM_onPalette('mono');
+    if(e.code==='Space'){ e.preventDefault(); HM_onBurst({power:1}); }
+    if(e.key==='d'||e.key==='D'){ HM_onDrop(); }
+  });
+  </script>
+
+  <script>
+    // optional URL overrides for coin link
+    (function(){
+      const CONFIG = { coinURL: "https://pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump" };
+      const p = new URLSearchParams(location.search);
+      if (p.get('coin')) CONFIG.coinURL = p.get('coin');
+      document.getElementById('coinText').textContent = CONFIG.coinURL.replace(/^https?:\\/\\//,'');
+      document.getElementById('coinUrl').href = CONFIG.coinURL;
+    })();
+  </script>
+</body>
+</html>
