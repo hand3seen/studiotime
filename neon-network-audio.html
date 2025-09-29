@@ -1,0 +1,444 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Headmosh Neon Network — Visuals + Browser-Proof Audio Engine</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <style>
+    html,body{margin:0;height:100%;background:#000;font-family:ui-sans-serif,system-ui,Inter,Roboto,Arial;cursor:default}
+    .pump-link{
+      position:fixed;left:18px;top:18px;z-index:9;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);
+      border:1px solid rgba(255,255,255,.15);border-radius:12px;color:#e8f3ff;text-decoration:none;
+      padding:10px 14px;font-size:14px;line-height:1;display:flex;gap:10px;align-items:center
+    }
+    .pump-dot{width:8px;height:8px;border-radius:50%;background:rgb(60,200,255);box-shadow:0 0 12px 4px rgba(60,200,255,.7)}
+    #mic-hint{position:fixed;right:18px;top:18px;color:#cde;z-index:9;font-size:12px;background:rgba(0,0,0,.5);
+      padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12)}
+    #meter{position:fixed;left:18px;bottom:18px;width:260px;height:10px;background:#111;border:1px solid #333;border-radius:999px;overflow:hidden}
+    #meter > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#27ffbe,#4ca5ff)}
+    #ctrls{position:fixed;left:18px;top:72px;display:flex;gap:8px;align-items:center;z-index:9}
+    #ctrls select, #ctrls button{
+      background:rgba(0,0,0,.55);color:#e8f3ff;border:1px solid rgba(255,255,255,.15);
+      border-radius:10px;padding:8px 10px;font-size:13px
+    }
+  </style>
+</head>
+<body>
+  <a id="coinUrl" class="pump-link" target="_blank" rel="noreferrer">
+    <span class="pump-dot"></span>
+    <span id="coinText">pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump</span>
+  </a>
+
+  <div id="ctrls">
+    <select id="deviceSelect"><option>Loading inputs…</option></select>
+    <button id="toggle">Enable Mic</button>
+    <span id="status" style="font-size:12px;color:#9fe;">Idle</span>
+  </div>
+
+  <div id="mic-hint">Press <b>M</b> to (re)enable mic • [K/J] Sens • [T] Turbo • [H] Bass bias • [N] Palette • [B] Bloom</div>
+  <div id="meter"><i></i></div>
+
+<script>
+/* ===== Headmosh — visuals from your Neon Network + browser-proof audio engine =====
+   - Device picker (Chrome/Safari/Firefox)
+   - Auto-gain normalization + RMS meter
+   - Low-band peak punch
+   - Hotkeys: [M] mic [K/J] sens [T] turbo [H] bass bias [N] palette [B] bloom [L] logo [R] reset
+*/
+
+// ---------------- URL/Config ----------------
+const CONFIG = {
+  particleDensity: 0.10,
+  maxSpeed: 1.8,
+  connectRadius: 190,
+  trailAlpha: 34,
+  bloomPasses: 1,
+  showLogo: true,
+  bannerTitle: "HEADMOSH STUDIO",
+  bannerSub: "Go Head-First.",
+  coinURL: "https://pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump",
+};
+(function initParams(){
+  const p = new URLSearchParams(location.search);
+  if (p.get('title')) CONFIG.bannerTitle = p.get('title');
+  if (p.get('sub')) CONFIG.bannerSub = p.get('sub');
+  if (p.get('coin')) CONFIG.coinURL = p.get('coin');
+})();
+document.getElementById('coinText').textContent = CONFIG.coinURL.replace(/^https?:\\/\\//,'');
+document.getElementById('coinUrl').href = CONFIG.coinURL;
+
+// ---------------- Audio Engine (no p5.sound; pure WebAudio) ----------------
+class AudioEngine {
+  constructor(){
+    this.ctx = null;
+    this.an = null;
+    this.src = null;
+    this.stream = null;
+    this.buf = null;
+    this.fftSize = 2048;
+    this.freq = null;
+    this.time = null;
+    this.rms = 0.0;
+    this.RMS_ATTACK = 0.12;
+    this.RMS_DECAY = 0.01;
+    this.smoothing = 0.08;
+    this.enabled = false;
+  }
+  async listInputs(){
+    try{
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return devices.filter(d => d.kind === 'audioinput');
+    }catch(e){ console.warn(e); return []; }
+  }
+  async start(deviceId=null){
+    if (!this.ctx) this.ctx = new (window.AudioContext||window.webkitAudioContext)();
+    const constraints = { audio: { deviceId: deviceId ? { exact: deviceId } : undefined, echoCancellation:false, noiseSuppression:false, autoGainControl:false } };
+    this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    this.src = this.ctx.createMediaStreamSource(this.stream);
+    this.an = this.ctx.createAnalyser();
+    this.an.fftSize = this.fftSize;
+    this.an.smoothingTimeConstant = this.smoothing;
+    this.src.connect(this.an);
+    this.freq = new Uint8Array(this.an.frequencyBinCount);
+    this.time = new Float32Array(this.an.fftSize);
+    this.enabled = true;
+  }
+  stop(){
+    if (this.stream){
+      this.stream.getTracks().forEach(t => t.stop());
+      this.stream = null;
+    }
+    if (this.src){ try{ this.src.disconnect(); }catch{} this.src=null; }
+    this.enabled = false;
+  }
+  _bandEnergy(fStart, fEnd){
+    if (!this.an) return 0;
+    const nyquist = this.ctx.sampleRate / 2;
+    const startIndex = Math.max(0, Math.floor((fStart/nyquist)*this.freq.length));
+    const endIndex = Math.min(this.freq.length-1, Math.ceil((fEnd/nyquist)*this.freq.length));
+    let sum = 0;
+    for (let i=startIndex;i<=endIndex;i++) sum += this.freq[i];
+    const avg = sum / Math.max(1,(endIndex-startIndex+1));
+    return avg / 255; // 0..1
+  }
+  levels(){
+    if (!this.an) return {low:0, mid:0, high:0, rms:0, norm:0, peakLow:false};
+    this.an.getByteFrequencyData(this.freq);
+    this.an.getFloatTimeDomainData(this.time);
+    // RMS
+    let s=0;
+    for (let i=0;i<this.time.length;i++){ const v=this.time[i]; s+=v*v; }
+    const curRms = Math.sqrt(s/this.time.length);
+    // rolling RMS for auto-gain
+    if (curRms > this.rms) this.rms += (curRms - this.rms) * this.RMS_ATTACK;
+    else this.rms += (curRms - this.rms) * this.RMS_DECAY;
+    const norm = this.rms > 0.0005 ? Math.min(3.0, curRms / (this.rms*1.2)) : 0;
+
+    const low  = this._bandEnergy(38, 160);
+    const mid  = this._bandEnergy(160, 1500);
+    const high = this._bandEnergy(1500, 6000);
+
+    // crude low-band peak detection
+    const peakLow = low > 0.55 && norm > 0.9;
+
+    return {low, mid, high, rms:this.rms, norm, peakLow};
+  }
+}
+const audio = new AudioEngine();
+
+// ---------------- Visuals (your Neon Network with small tweaks) ----------------
+let particles = [];
+let pg, t = 0;
+let bloom = true;
+let palettes, paletteIndex = 0;
+
+let energy = 0;                 // envelope (0..1+)
+let sensitivity = 1.6;          // baseline higher for visibility
+let extraBassBias = true;
+
+const MAX_CONNECTIONS_PER_PARTICLE = 22;
+
+class Particle {
+  constructor(){
+    this.x = random(width);
+    this.y = random(height);
+    this.vx = random(-CONFIG.maxSpeed, CONFIG.maxSpeed);
+    this.vy = random(-CONFIG.maxSpeed, CONFIG.maxSpeed);
+  }
+  move(){
+    const ang = noise(this.x*0.0012, this.y*0.0012, t*0.001) * TAU * (1.1 + energy*1.4);
+    const punch = (0.03 + energy*0.11 + energy*energy*0.16) * sensitivity;
+    this.vx += Math.cos(ang) * punch;
+    this.vy += Math.sin(ang) * punch;
+
+    const sp = Math.hypot(this.vx, this.vy);
+    if (sp > CONFIG.maxSpeed){
+      this.vx = (this.vx/sp)*CONFIG.maxSpeed;
+      this.vy = (this.vy/sp)*CONFIG.maxSpeed;
+    }
+
+    this.x += this.vx;
+    this.y += this.vy;
+
+    if (this.x < -12) this.x = width+12;
+    if (this.x > width+12) this.x = -12;
+    if (this.y < -12) this.y = height+12;
+    if (this.y > height+12) this.y = -12;
+  }
+  dot(g){
+    g.noStroke();
+    g.fill(255, 220);
+    g.circle(this.x, this.y, 3.2 + energy*2.2);
+  }
+  connect(g, others){
+    const cols = palettes[paletteIndex];
+    let links = 0;
+    for (let i=0;i<others.length && links<MAX_CONNECTIONS_PER_PARTICLE;i++){
+      const p = others[i];
+      const dx = this.x - p.x, dy = this.y - p.y;
+      const d = Math.hypot(dx, dy);
+      if (d < CONFIG.connectRadius){
+        const widthBoost = 1.0 + energy*3.4 + energy*energy*1.8;
+        const w = map(d, 0, CONFIG.connectRadius, 3.6*widthBoost, 0.35);
+        const a = map(d, 0, CONFIG.connectRadius, 250, 90);
+        const c = cols[Math.floor(map(d,0,CONFIG.connectRadius,0,cols.length))%cols.length];
+
+        g.stroke(c[0], c[1], c[2], a);
+        g.strokeWeight(w);
+
+        const j = 8*(1+energy*1.2);
+        const mx = (this.x + p.x)/2 + Math.sin((this.x+t)*0.014)*j;
+        const my = (this.y + p.y)/2 + Math.cos((this.y+t)*0.014)*j;
+        g.noFill();
+        g.beginShape();
+        g.curveVertex(this.x, this.y);
+        g.curveVertex(this.x, this.y);
+        g.curveVertex(mx, my);
+        g.curveVertex(p.x, p.y);
+        g.curveVertex(p.x, p.y);
+        g.endShape();
+
+        links++;
+      }
+    }
+  }
+}
+
+function setup(){
+  pixelDensity(1);
+  createCanvas(windowWidth, windowHeight);
+  pg = createGraphics(width, height);
+
+  palettes = [
+    [ [10,240,255], [180,90,255], [255,80,180], [255,210,60] ],
+    [ [90,200,255], [90,255,160], [255,120,120], [250,250,180] ],
+    [ [255,100,40], [255,220,40], [80,220,255], [120,120,255] ],
+    [ [140,255,220], [255,80,140], [110,150,255], [255,220,160] ],
+  ];
+
+  initParticles();
+  pg.background(0);
+  initDevicesUI(); // fill device list
+}
+
+function initParticles(){
+  particles.length = 0;
+  const count = Math.floor(width * CONFIG.particleDensity);
+  for (let i=0;i<count;i++) particles.push(new Particle());
+}
+
+function drawBackground(g){
+  const cx = width*0.5 + Math.sin(t*0.0012)*80*(0.6+energy);
+  const cy = height*0.5 + Math.cos(t*0.0011)*60*(0.6+energy);
+  for (let r = Math.max(width,height); r>0; r -= 7){
+    const k = map(r, 0, Math.max(width,height), 0, 1);
+    const v = 10 + 26*(1-k)*(0.5+0.5*Math.sin(t*0.002+energy*3.2));
+    g.noStroke();
+    g.fill(v, v*0.8, v*0.9, 16);
+    g.circle(cx, cy, r*2);
+  }
+}
+
+function draw(){
+  t++;
+
+  // ---------- ENERGY ENVELOPE ----------
+  const ATTACK = 0.95;
+  const DECAY  = 0.22;
+  const BASS_BIAS = extraBassBias ? 0.78 : 0.60;
+
+  let target = 0;
+  let levelVis = 0;
+
+  if (audio.enabled){
+    const L = audio.levels();
+    let e = (L.low * BASS_BIAS + L.mid * 0.22 + L.high * 0.06);
+    const norm = L.norm;
+    e = Math.max(e, norm * 0.9);
+    if (L.peakLow) e = Math.min(1.6, e + 0.55); // peak punch
+    target = Math.min(1.6, e * sensitivity);
+    levelVis = Math.min(1, norm);
+    // update status
+    document.getElementById('status').textContent = `Sens ${sensitivity.toFixed(2)} • RMS ${L.rms.toFixed(4)}`;
+  }
+
+  energy += (target - energy) * (target > energy ? ATTACK : DECAY);
+
+  // ---------- Render ----------
+  pg.noStroke();
+  pg.fill(0, CONFIG.trailAlpha);
+  pg.rect(0,0,width,height);
+
+  drawBackground(pg);
+
+  for (let p of particles) p.move();
+  for (let i=0;i<particles.length;i++){
+    const p = particles[i];
+    p.dot(pg);
+    p.connect(pg, particles.slice(i+1));
+  }
+
+  if (energy > 1.1){
+    push();
+    drawingContext.globalCompositeOperation = 'screen';
+    fill(255, 255, 255, map(energy,1.1,1.6,10,40));
+    rect(0,0,width,height);
+    pop();
+  }
+
+  image(pg, 0, 0);
+
+  if (bloom){
+    push();
+    drawingContext.globalCompositeOperation = 'screen';
+    for (let i=0;i<CONFIG.bloomPasses;i++) image(pg, 0, 0);
+    pop();
+  }
+
+  if ((frameCount & 3) === 0) scanlines();
+
+  drawBanner();
+  drawHUD(levelVis);
+}
+
+function scanlines(){
+  stroke(255, 8);
+  strokeWeight(1);
+  for (let y=0; y<height; y+=3) line(0,y,width,y);
+}
+
+function drawBanner(){
+  if (!CONFIG.showLogo) return;
+  const title = CONFIG.bannerTitle;
+  const sub = CONFIG.bannerSub;
+  const jx = (noise(t*0.02)-0.5)*2.0;
+
+  push();
+  textAlign(LEFT, TOP);
+  noStroke();
+  fill(0, 170);
+  textSize(42);
+  const w = textWidth(title) + 260;
+  rect(18, 120, w, 84, 16);
+
+  fill(255, 255, 255, 40);
+  text(title, 36 + jx + 0.8, 136 + 0.8);
+  fill(255);
+  text(title, 36 + jx, 136);
+
+  textSize(18);
+  fill(220);
+  text(sub, 36, 172);
+  pop();
+}
+
+function drawHUD(levelVis=0){
+  const meter = document.querySelector('#meter > i');
+  if (meter){
+    meter.style.width = (levelVis*100).toFixed(1) + '%';
+  }
+  const hud = `Sens ${sensitivity.toFixed(2)}  Bass ${extraBassBias?"BIAS":"norm"}  Energy ${energy.toFixed(2)}  [M] Mic [K/J] Sens [T] Turbo [H] Bass [N] Palette [B] Bloom [L] Logo [R] Reset`;
+  const w = textWidth(hud) + 24;
+  noStroke();
+  fill(0, 140);
+  rect(width - w - 20, height - 50, w, 34, 10);
+  fill(230);
+  textAlign(RIGHT, CENTER);
+  textSize(14);
+  text(hud, width - 32, height - 33);
+}
+
+// --------------- Devices UI ----------------
+async function initDevicesUI(){
+  const sel = document.getElementById('deviceSelect');
+  const btn = document.getElementById('toggle');
+  const hint = document.getElementById('mic-hint');
+  const status = document.getElementById('status');
+
+  // Request perms once so enumerateDevices has labels
+  try { await navigator.mediaDevices.getUserMedia({audio:true}); } catch{}
+
+  const refresh = async () => {
+    const inputs = await audio.listInputs();
+    sel.innerHTML = '';
+    if (!inputs.length){
+      const opt = document.createElement('option');
+      opt.textContent = 'No inputs found';
+      sel.appendChild(opt);
+      sel.disabled = true;
+    } else {
+      for (const d of inputs){
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `Input ${sel.length+1}`;
+        sel.appendChild(opt);
+      }
+      sel.disabled = false;
+    }
+  };
+  await refresh();
+
+  btn.onclick = async () => {
+    try{
+      if (!audio.enabled){
+        await audio.start(sel.value || null);
+        hint.style.display = 'none';
+        btn.textContent = 'Disable Mic';
+        status.textContent = 'Listening…';
+      } else {
+        audio.stop();
+        hint.style.display = 'block';
+        btn.textContent = 'Enable Mic';
+        status.textContent = 'Idle';
+      }
+    }catch(e){
+      console.warn('Mic error:', e);
+      status.textContent = 'Mic blocked — pick a device/allow mic in site settings.';
+    }
+  };
+}
+
+// --------------- Hotkeys ----------------
+function keyPressed(){
+  if (key==='M'||key==='m'){ document.getElementById('toggle').click(); }
+  if (key==='B'||key==='b') bloom = !bloom;
+  if (key==='N'||key==='n') paletteIndex = (paletteIndex+1)%palettes.length;
+  if (key==='L'||key==='l') CONFIG.showLogo = !CONFIG.showLogo;
+  if (key==='R'||key==='r') initParticles();
+
+  if (key==='K'||key==='k') sensitivity = Math.min(3.2, sensitivity + 0.08);
+  if (key==='J'||key==='j') sensitivity = Math.max(0.5, sensitivity - 0.08);
+  if (key==='T'||key==='t') sensitivity = Math.min(3.2, sensitivity + 0.35);
+  if (key==='H'||key==='h') extraBassBias = !extraBassBias;
+}
+
+function windowResized(){
+  resizeCanvas(windowWidth, windowHeight);
+  pg = createGraphics(width, height);
+  pg.background(0);
+  initParticles();
+}
+</script>
+</body>
+</html>
